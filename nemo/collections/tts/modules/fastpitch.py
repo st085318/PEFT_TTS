@@ -43,6 +43,8 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import torch
+from typing import Optional, List
+from omegaconf import DictConfig
 
 from nemo.collections.tts.modules.submodules import ConditionalInput, ConditionalLayerNorm
 from nemo.collections.tts.parts.utils.helpers import binarize_attention_parallel, regulate_len
@@ -60,6 +62,10 @@ from nemo.core.neural_types.elements import (
     TokenLogDurationType,
 )
 from nemo.core.neural_types.neural_type import NeuralType
+
+from nemo.collections.tts.modules.adapters import FFTransformerDecoderAdapter
+from adapters.transformer import FFTransformerDecoderMultispeakerAdapter
+from nemo.collections.asr.parts.utils import adapter_utils
 
 
 def average_features(pitch, durs):
@@ -152,6 +158,80 @@ class TemporalPredictor(NeuralModule):
         out = out.transpose(1, 2)
         out = self.fc(out) * enc_mask
         return out.squeeze(-1)
+
+class TemporalPredictorTransformer(NeuralModule, adapter_mixins.AdapterModuleMixin):
+    """Predicts a single float per each temporal location"""
+
+    def __init__(
+        self, 
+        n_layer,
+        n_head,
+        d_model,
+        d_head,
+        d_inner,
+        kernel_size,
+        dropout,
+        dropatt,
+        dropemb=0.0,
+        pre_lnorm=False,
+        condition_types=[],
+        adapter_connection=None,
+    ):
+        super(TemporalPredictorTransformer, self).__init__()
+
+        self.predictor = FFTransformerDecoderMultispeakerAdapter(
+            n_layer,
+            n_head,
+            d_model,
+            d_head,
+            d_inner,
+            kernel_size,
+            dropout,
+            dropatt,
+            dropemb,
+            pre_lnorm,
+            condition_types,
+            adapter_connection
+        )
+        self.fc = torch.nn.Linear(d_model, 1, bias=True)
+
+        # Use for adapter input dimension
+        self.filter_size = kernel_size
+
+    @property
+    def input_types(self):
+        return {
+            "enc": NeuralType(('B', 'T', 'D'), EncodedRepresentation()),
+            "enc_mask": NeuralType(('B', 'T', 1), TokenDurationType()),
+            "conditioning": NeuralType(('B', 'T', 'D'), EncodedRepresentation(), optional=True),
+        }
+
+    @property
+    def output_types(self):
+        return {
+            "out": NeuralType(('B', 'T'), EncodedRepresentation()),
+        }
+
+    def forward(self, enc, enc_mask, conditioning=None):
+        length = torch.sum(enc_mask.squeeze(-1), dim=-1)
+        out, mask = self.predictor(input=enc, seq_lens=length, conditioning=conditioning)
+        out = self.fc(out) * mask
+        return out.squeeze(-1)
+    
+    def add_adapter(self, name: str, cfg: dict):
+        self.predictor.add_adapter(name, cfg)
+
+    def is_adapter_available(self) -> bool:
+        return self.predictor.is_adapter_available()
+
+    def set_enabled_adapters(self, name: Optional[str] = None, enabled: bool = True):
+        self.predictor.set_enabled_adapters(name, enabled)
+
+    def get_enabled_adapters(self) -> List[str]:
+        return self.predictor.get_enabled_adapters()
+
+    def _update_adapter_cfg_input_dim(self, cfg: DictConfig):
+        return self.predictor._update_adapter_cfg_input_dim(cfg)
 
 
 class FastPitchModule(NeuralModule, adapter_mixins.AdapterModuleMixin):
